@@ -44,6 +44,7 @@ from path import Path
 from torch.utils.data import (DataLoader, RandomSampler, SequentialSampler,
                               TensorDataset)
 
+from parallel import DataParallelCriterion, DataParallelModel
 from pytorch_pretrained_bert import (CONFIG_NAME, WEIGHTS_NAME, OpenAIAdam,
                                      OpenAIGPTLMHeadModel, OpenAIGPTTokenizer,
                                      cached_path)
@@ -126,14 +127,28 @@ def save_checkpoint(save_dir, model, tokenizer):
     tokenizer.save_vocabulary(save_dir)
 
 
-def compute_loss(criterion, logits, labels):
-    # Shift so that tokens < n predict n
-    shift_logits = logits[..., :-1, :].contiguous()
-    shift_labels = labels[..., 1:].contiguous()
-    # Flatten the tokens
-    loss = criterion(
-        shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-    return loss
+class LMLoss(torch.nn.CrossEntropyLoss):
+    """Language modeling loss."""
+
+    def __init__(self,
+                 weight=None,
+                 size_average=None,
+                 ignore_index=-100,
+                 reduce=None,
+                 reduction='mean'):
+        super(LMLoss, self).__init__(weight, size_average, ignore_index,
+                                     reduce, reduction)
+
+    def forward(self, *inputs):
+        logits, labels = tuple(inputs)
+        # Shift so that tokens < n predict n
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+        # Flatten the tokens
+        loss = super(LMLoss, self).forward(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1))
+        return loss
 
 
 if __name__ == '__main__':
@@ -223,8 +238,11 @@ if __name__ == '__main__':
     assert CLF_TOKEN in tokenizer.special_tokens
     model = OpenAIGPTLMHeadModel.from_pretrained(
         args.model_folder, num_special_tokens=len(tokenizer.special_tokens))
+    criterion = LMLoss(ignore_index=MASK_VALUE, reduction='sum')
     if use_cuda:
-        model = torch.nn.DataParallel(model).cuda()
+        model = DataParallelModel(model).cuda()
+        # Losses from multiple GPUs are summed. Need to apply appropriate normalization.
+        criterion = DataParallelCriterion(criterion).cuda()
 
     n_positions = model.module.config.n_positions if use_cuda else model.config.n_positions
     if args.src_seq_length_trunc + args.tgt_seq_length_trunc + 2 > n_positions:
@@ -278,7 +296,6 @@ if __name__ == '__main__':
         max_grad_norm=args.max_grad_norm,
         weight_decay=args.weight_decay,
         t_total=args.train_steps)
-    criterion = torch.nn.CrossEntropyLoss(ignore_index=MASK_VALUE)
 
     # Multi-GPU Training
     model.train()
@@ -287,16 +304,17 @@ if __name__ == '__main__':
     for _ in range(train_epochs):
         for _, data_batch in enumerate(train_dataloader):
             data_batch = data_batch[0].cuda()
+            n_elements = torch.sum(data_batch[..., 1:] != MASK_VALUE).item()
+
             predictions = model(data_batch)
-            loss = compute_loss(criterion, predictions, data_batch)
+            loss = criterion(predictions, data_batch) / n_elements
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
             tr_steps += 1
-            tr_loss.update(loss.item(),
-                           torch.sum(data_batch[..., 1:] != MASK_VALUE).item())
+            tr_loss.update(loss.item(), n_elements)
 
             if tr_steps % args.report_steps == 0:
                 logger.info('step {:6d}; loss {:8.4f}; lr: {:8.2e}'.format(
@@ -313,13 +331,13 @@ if __name__ == '__main__':
                     valid_loss = Statistics()
                     for data_batch in eval_dataloader:
                         data_batch = data_batch[0].cuda()
+                        n_elements = torch.sum(
+                            data_batch[..., 1:] != MASK_VALUE).item()
+
                         with torch.no_grad():
-                            loss = compute_loss(criterion,
-                                                model(data_batch), data_batch)
-                        valid_loss.update(
-                            loss.item(),
-                            torch.sum(
-                                data_batch[..., 1:] != MASK_VALUE).item())
+                            loss = criterion(model(data_batch),
+                                             data_batch) / n_elements
+                        valid_loss.update(loss.item(), n_elements)
                     logger.info('Eval at step {:6d}; loss {:8.4f}'.format(
                         tr_steps, valid_loss.loss))
                     model.train()
