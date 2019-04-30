@@ -126,6 +126,16 @@ def save_checkpoint(save_dir, model, tokenizer):
     tokenizer.save_vocabulary(save_dir)
 
 
+def compute_loss(criterion, logits, labels):
+    # Shift so that tokens < n predict n
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = labels[..., 1:].contiguous()
+    # Flatten the tokens
+    loss = criterion(
+        shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+    return loss
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -171,7 +181,6 @@ if __name__ == '__main__':
     parser.add_argument('--warmup_proportion', type=float, default=0.002)
     parser.add_argument('--lr_schedule', type=str, default='warmup_linear')
     parser.add_argument('--weight_decay', type=float, default=0.01)
-    parser.add_argument('--gpu', type=int, default=0)
     parser.add_argument('--eval_batch_size', type=int, default=8)
     parser.add_argument(
         "--save_root_dir",
@@ -202,11 +211,10 @@ if __name__ == '__main__':
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
+    use_cuda = False
     if torch.cuda.is_available():
-        device = torch.device('cuda:' + str(args.gpu))
+        use_cuda = True
         torch.cuda.manual_seed_all(args.seed)
-    else:
-        device = torch.device('cpu')
 
     # Load tokenizer and model
     tokenizer_dir = os.path.dirname(args.train_dataset)
@@ -215,9 +223,11 @@ if __name__ == '__main__':
     assert CLF_TOKEN in tokenizer.special_tokens
     model = OpenAIGPTLMHeadModel.from_pretrained(
         args.model_folder, num_special_tokens=len(tokenizer.special_tokens))
-    model.to(device)
+    if use_cuda:
+        model = torch.nn.DataParallel(model).cuda()
 
-    if args.src_seq_length_trunc + args.tgt_seq_length_trunc + 2 > model.config.n_positions:
+    n_positions = model.module.config.n_positions if use_cuda else model.config.n_positions
+    if args.src_seq_length_trunc + args.tgt_seq_length_trunc + 2 > n_positions:
         raise ValueError('Exceeds maximum allowed sequence length.')
 
     logger.info('Encoding dataset...')
@@ -268,15 +278,17 @@ if __name__ == '__main__':
         max_grad_norm=args.max_grad_norm,
         weight_decay=args.weight_decay,
         t_total=args.train_steps)
+    criterion = torch.nn.CrossEntropyLoss(ignore_index=MASK_VALUE)
 
-    # Train
+    # Multi-GPU Training
     model.train()
     tr_steps = 0
     tr_loss = Statistics()
     for _ in range(train_epochs):
         for _, data_batch in enumerate(train_dataloader):
-            data_batch = data_batch[0].to(device)
-            loss = model(data_batch, lm_labels=data_batch)
+            data_batch = data_batch[0].cuda()
+            predictions = model(data_batch)
+            loss = compute_loss(criterion, predictions, data_batch)
 
             optimizer.zero_grad()
             loss.backward()
@@ -300,9 +312,10 @@ if __name__ == '__main__':
                     model.eval()
                     valid_loss = Statistics()
                     for data_batch in eval_dataloader:
-                        data_batch = data_batch[0].to(device)
+                        data_batch = data_batch[0].cuda()
                         with torch.no_grad():
-                            loss = model(data_batch, lm_labels=data_batch)
+                            loss = compute_loss(criterion,
+                                                model(data_batch), data_batch)
                         valid_loss.update(
                             loss.item(),
                             torch.sum(
