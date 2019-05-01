@@ -41,6 +41,7 @@ import random
 import numpy as np
 import torch
 from path import Path
+from torch.nn.parallel.scatter_gather import gather
 from torch.utils.data import (DataLoader, RandomSampler, SequentialSampler,
                               TensorDataset)
 
@@ -48,7 +49,7 @@ from parallel import DataParallelCriterion, DataParallelModel
 from pytorch_pretrained_bert import (CONFIG_NAME, WEIGHTS_NAME, OpenAIAdam,
                                      OpenAIGPTLMHeadModel, OpenAIGPTTokenizer,
                                      cached_path)
-from report import Statistics
+from report import Statistics, accuracy
 
 DELIMITER_TOKEN = '_delimiter_'
 CLF_TOKEN = '_clf_'
@@ -314,7 +315,7 @@ if __name__ == '__main__':
             optimizer.step()
 
             tr_steps += 1
-            tr_loss.update(loss.item(), n_elements)
+            tr_loss.update(loss.item(), 0, n_elements)
 
             if tr_steps % args.report_steps == 0:
                 logger.info('step {:6d}; loss {:8.4f}; lr: {:8.2e}'.format(
@@ -331,15 +332,21 @@ if __name__ == '__main__':
                     valid_loss = Statistics()
                     for data_batch in eval_dataloader:
                         data_batch = data_batch[0].cuda()
-                        n_elements = torch.sum(
-                            data_batch[..., 1:] != MASK_VALUE).item()
 
                         with torch.no_grad():
-                            loss = criterion(model(data_batch),
+                            predictions = model(data_batch)
+
+                            token_accuracy, n_elements = accuracy(
+                                torch.argmax(
+                                    gather(predictions, 0, dim=0)[..., :-1, :],
+                                    -1), data_batch[..., 1:], MASK_VALUE)
+                            loss = criterion(predictions,
                                              data_batch) / n_elements
-                        valid_loss.update(loss.item(), n_elements)
-                    logger.info('Eval at step {:6d}; loss {:8.4f}'.format(
-                        tr_steps, valid_loss.loss))
+                            valid_loss.update(loss.item(), token_accuracy,
+                                              n_elements)
+                    logger.info(
+                        'Eval at step {:6d}; loss {:8.4f};  accuracy {:8.4f}'.
+                        format(tr_steps, valid_loss.loss, valid_loss.accuracy))
                     model.train()
 
             # Stop
