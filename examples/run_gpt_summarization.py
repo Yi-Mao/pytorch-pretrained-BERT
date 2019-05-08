@@ -41,14 +41,11 @@ import random
 import numpy as np
 import torch
 from path import Path
-from torch.nn.parallel.scatter_gather import gather
 from torch.utils.data import (DataLoader, RandomSampler, SequentialSampler,
                               TensorDataset)
 
-from parallel import DataParallelCriterion, DataParallelModel
 from pytorch_pretrained_bert import (CONFIG_NAME, WEIGHTS_NAME, OpenAIAdam,
-                                     OpenAIGPTLMHeadModel, OpenAIGPTTokenizer,
-                                     cached_path)
+                                     OpenAIGPTLMHeadModel, OpenAIGPTTokenizer)
 from report import Statistics, accuracy
 
 DELIMITER_TOKEN = '_delimiter_'
@@ -90,12 +87,15 @@ def load_summarization_dataset(dataset_path, max_src_seq_length,
     output = None
     if dataset_path:
         original = torch.load(dataset_path)
+        logger.info('# of examples in {0}: {1}'.format(dataset_path,
+                                                       len(original)))
 
-        original = [
+        original[:] = [
             t for t in original
             if len(t[0]) <= max_src_seq_length
             and len(t[1]) <= max_tgt_seq_length
         ]
+        logger.info('# of examples after filtering: {0}'.format(len(original)))
 
         # Get sequence length.
         src_seq_length = min(
@@ -103,6 +103,7 @@ def load_summarization_dataset(dataset_path, max_src_seq_length,
         tgt_seq_length = min(
             max(len(t[1]) for t in original), tgt_seq_length_trunc)
         seq_length = src_seq_length + tgt_seq_length + 2
+        logger.info('Sequence length: {0}'.format(seq_length))
 
         output = np.full(
             (len(original), seq_length), fill_value=MASK_VALUE, dtype=np.int64)
@@ -231,6 +232,7 @@ if __name__ == '__main__':
     if torch.cuda.is_available():
         use_cuda = True
         torch.cuda.manual_seed_all(args.seed)
+        logger.info('Use {} GPUs'.format(torch.cuda.device_count()))
 
     # Load tokenizer and model
     tokenizer_dir = os.path.dirname(args.train_dataset)
@@ -241,9 +243,7 @@ if __name__ == '__main__':
         args.model_folder, num_special_tokens=len(tokenizer.special_tokens))
     criterion = LMLoss(ignore_index=MASK_VALUE, reduction='sum')
     if use_cuda:
-        model = DataParallelModel(model).cuda()
-        # Losses from multiple GPUs are summed. Need to apply appropriate normalization.
-        criterion = DataParallelCriterion(criterion).cuda()
+        model = torch.nn.DataParallel(model).cuda()
 
     n_positions = model.module.config.n_positions if use_cuda else model.config.n_positions
     if args.src_seq_length_trunc + args.tgt_seq_length_trunc + 2 > n_positions:
@@ -337,9 +337,8 @@ if __name__ == '__main__':
                             predictions = model(data_batch)
 
                             token_accuracy, n_elements = accuracy(
-                                torch.argmax(
-                                    gather(predictions, 0, dim=0)[..., :-1, :],
-                                    -1), data_batch[..., 1:], MASK_VALUE)
+                                torch.argmax(predictions[..., :-1, :], -1),
+                                data_batch[..., 1:], MASK_VALUE)
                             loss = criterion(predictions,
                                              data_batch) / n_elements
                             valid_loss.update(loss.item(), token_accuracy,
