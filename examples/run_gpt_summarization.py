@@ -41,11 +41,11 @@ import random
 import numpy as np
 import torch
 from path import Path
+from pytorch_pretrained_bert import (CONFIG_NAME, WEIGHTS_NAME, OpenAIAdam,
+                                     OpenAIGPTLMHeadModel, OpenAIGPTTokenizer)
 from torch.utils.data import (DataLoader, RandomSampler, SequentialSampler,
                               TensorDataset)
 
-from pytorch_pretrained_bert import (CONFIG_NAME, WEIGHTS_NAME, OpenAIAdam,
-                                     OpenAIGPTLMHeadModel, OpenAIGPTTokenizer)
 from report import Statistics, accuracy
 
 DELIMITER_TOKEN = '_delimiter_'
@@ -211,7 +211,7 @@ if __name__ == '__main__':
     parser.add_argument('--save_checkpoint_steps', type=int, default=5000)
     args = parser.parse_args()
 
-    os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
+    os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
     # Add datetime to save dir name.
     args.save_dir = os.path.join(
@@ -241,7 +241,7 @@ if __name__ == '__main__':
     assert CLF_TOKEN in tokenizer.special_tokens
     model = OpenAIGPTLMHeadModel.from_pretrained(
         args.model_folder, num_special_tokens=len(tokenizer.special_tokens))
-    criterion = LMLoss(ignore_index=MASK_VALUE, reduction='sum')
+    criterion = LMLoss(ignore_index=MASK_VALUE)
     if use_cuda:
         model = torch.nn.DataParallel(model).cuda()
 
@@ -308,7 +308,7 @@ if __name__ == '__main__':
             n_elements = torch.sum(data_batch[..., 1:] != MASK_VALUE).item()
 
             predictions = model(data_batch)
-            loss = criterion(predictions, data_batch) / n_elements
+            loss = criterion(predictions, data_batch)
 
             optimizer.zero_grad()
             loss.backward()
@@ -339,8 +339,7 @@ if __name__ == '__main__':
                             token_accuracy, n_elements = accuracy(
                                 torch.argmax(predictions[..., :-1, :], -1),
                                 data_batch[..., 1:], MASK_VALUE)
-                            loss = criterion(predictions,
-                                             data_batch) / n_elements
+                            loss = criterion(predictions, data_batch)
                             valid_loss.update(loss.item(), token_accuracy,
                                               n_elements)
                     logger.info(
