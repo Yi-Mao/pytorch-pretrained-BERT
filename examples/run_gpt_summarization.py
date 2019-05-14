@@ -129,28 +129,14 @@ def save_checkpoint(save_dir, model, tokenizer):
     tokenizer.save_vocabulary(save_dir)
 
 
-class LMLoss(torch.nn.CrossEntropyLoss):
-    """Language modeling loss."""
-
-    def __init__(self,
-                 weight=None,
-                 size_average=None,
-                 ignore_index=-100,
-                 reduce=None,
-                 reduction='mean'):
-        super(LMLoss, self).__init__(weight, size_average, ignore_index,
-                                     reduce, reduction)
-
-    def forward(self, *inputs):
-        logits, labels = tuple(inputs)
-        # Shift so that tokens < n predict n
-        shift_logits = logits[..., :-1, :].contiguous()
-        shift_labels = labels[..., 1:].contiguous()
-        # Flatten the tokens
-        loss = super(LMLoss, self).forward(
-            shift_logits.view(-1, shift_logits.size(-1)),
-            shift_labels.view(-1))
-        return loss
+def compute_loss(criterion, logits, labels):
+    # Shift so that tokens < n predict n
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = labels[..., 1:].contiguous()
+    # Flatten the tokens
+    loss = criterion(
+        shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+    return loss
 
 
 if __name__ == '__main__':
@@ -241,9 +227,9 @@ if __name__ == '__main__':
     assert CLF_TOKEN in tokenizer.special_tokens
     model = OpenAIGPTLMHeadModel.from_pretrained(
         args.model_folder, num_special_tokens=len(tokenizer.special_tokens))
-    criterion = LMLoss(ignore_index=MASK_VALUE)
     if use_cuda:
         model = torch.nn.DataParallel(model).cuda()
+    criterion = torch.nn.CrossEntropyLoss(ignore_index=MASK_VALUE)
 
     n_positions = model.module.config.n_positions if use_cuda else model.config.n_positions
     if args.src_seq_length_trunc + args.tgt_seq_length_trunc + 2 > n_positions:
@@ -304,11 +290,13 @@ if __name__ == '__main__':
     tr_loss = Statistics()
     for _ in range(train_epochs):
         for _, data_batch in enumerate(train_dataloader):
-            data_batch = data_batch[0].cuda()
+            data_batch = data_batch[0]
+            if use_cuda:
+                data_batch = data_batch.cuda()
             n_elements = torch.sum(data_batch[..., 1:] != MASK_VALUE).item()
 
             predictions = model(data_batch)
-            loss = criterion(predictions, data_batch)
+            loss = compute_loss(criterion, predictions, data_batch)
 
             optimizer.zero_grad()
             loss.backward()
@@ -330,16 +318,19 @@ if __name__ == '__main__':
                 if eval_dataloader is not None:
                     model.eval()
                     valid_loss = Statistics()
-                    for data_batch in eval_dataloader:
-                        data_batch = data_batch[0].cuda()
+                    with torch.no_grad():
+                        for data_batch in eval_dataloader:
+                            data_batch = data_batch[0]
+                            if use_cuda:
+                                data_batch = data_batch.cuda()
 
-                        with torch.no_grad():
                             predictions = model(data_batch)
 
                             token_accuracy, n_elements = accuracy(
                                 torch.argmax(predictions[..., :-1, :], -1),
                                 data_batch[..., 1:], MASK_VALUE)
-                            loss = criterion(predictions, data_batch)
+                            loss = compute_loss(criterion, predictions,
+                                                data_batch)
                             valid_loss.update(loss.item(), token_accuracy,
                                               n_elements)
                     logger.info(
