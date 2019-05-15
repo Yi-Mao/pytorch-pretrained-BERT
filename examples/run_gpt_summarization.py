@@ -197,8 +197,6 @@ if __name__ == '__main__':
     parser.add_argument('--save_checkpoint_steps', type=int, default=5000)
     args = parser.parse_args()
 
-    os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
-
     # Add datetime to save dir name.
     args.save_dir = os.path.join(
         args.save_root_dir, args.save_dir_prefix +
